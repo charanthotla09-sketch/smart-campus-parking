@@ -1,0 +1,338 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AI-Powered Smart Campus Parking System - Cloud Infrastructure (S3, DynamoDB, Lambda, SNS, IAM, EC2 Profile)'
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: 'Email address to receive parking availability and zone-full alerts (via SNS)'
+    Default: 'student@example.com'
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'prod', 'test']
+
+Resources:
+  # -------------------------------------------------------------
+  # 1. S3 Storage for Parking Camera Images & Detections
+  # -------------------------------------------------------------
+  ParkingStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'campus-parking-storage-${AWS::AccountId}-${AWS::Region}'
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: ['GET', 'PUT', 'POST']
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+
+  # -------------------------------------------------------------
+  # 2. DynamoDB Table for Real-time Parking Spot Availability
+  # -------------------------------------------------------------
+  ParkingSpotsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CampusParkingSpots
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: SpotId
+          AttributeType: S
+        - AttributeName: ZoneId
+          AttributeType: S
+        - AttributeName: Status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: SpotId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ZoneIndex
+          KeySchema:
+            - AttributeName: ZoneId
+              KeyType: HASH
+            - AttributeName: Status
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: SmartCampusParking
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------------
+  # 3. SNS Topic & Email Subscription for Mobile/Email Alerts
+  # -------------------------------------------------------------
+  ParkingAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: CampusParkingAlerts
+      DisplayName: Campus Parking Real-Time Alerts
+
+  ParkingAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ParkingAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # -------------------------------------------------------------
+  # 4. IAM Role for Lambda Function
+  # -------------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'CampusParkingLambdaRole-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CampusParkingProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ParkingStorageBucket.Arn
+                  - !Sub '${ParkingStorageBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ParkingSpotsTable.Arn
+                  - !Sub '${ParkingSpotsTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ParkingAlertsTopic
+
+  # -------------------------------------------------------------
+  # 5. AWS Lambda Function for Processing Detections & Updating DynamoDB
+  # -------------------------------------------------------------
+  ParkingProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CampusParkingProcessor
+      Runtime: python3.11
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref ParkingSpotsTable
+          SNS_TOPIC_ARN: !Ref ParkingAlertsTopic
+          OCCUPANCY_ALERT_THRESHOLD: '80'
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from datetime import datetime
+          from decimal import Decimal
+
+          AWS_REGION = os.environ.get('AWS_REGION', os.environ.get('AWS_DEFAULT_REGION', 'us-east-1'))
+          s3_client = boto3.client('s3', region_name=AWS_REGION)
+          dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
+          sns_client = boto3.client('sns', region_name=AWS_REGION)
+
+          TABLE_NAME = os.environ.get('DYNAMODB_TABLE', 'CampusParkingSpots')
+          SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN', '')
+          THRESHOLD_PCT = float(os.environ.get('OCCUPANCY_ALERT_THRESHOLD', '80'))
+
+          table = dynamodb.Table(TABLE_NAME)
+
+          def lambda_handler(event, context):
+              print("Received event:", json.dumps(event))
+              
+              # Process S3 event or direct invocation payload
+              if 'Records' in event and 's3' in event['Records'][0]:
+                  record = event['Records'][0]
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  
+                  if not key.endswith('.json'):
+                      return {'statusCode': 200, 'body': 'Skipping non-JSON object'}
+                      
+                  response = s3_client.get_object(Bucket=bucket, Key=key)
+                  data = json.loads(response['Body'].read().decode('utf-8'))
+              else:
+                  data = event
+
+              zone_id = data.get('zone_id', 'ZONE-A')
+              spots = data.get('spots', [])
+              timestamp = data.get('timestamp', datetime.utcnow().isoformat())
+              image_s3_url = data.get('image_s3_url', '')
+
+              total_spots = len(spots)
+              occupied_count = 0
+              vacant_count = 0
+
+              with table.batch_writer() as batch:
+                  for spot in spots:
+                      spot_id = spot.get('spot_id')
+                      status = spot.get('status', 'VACANT') # 'OCCUPIED' or 'VACANT'
+                      confidence = Decimal(str(round(spot.get('confidence', 0.0), 2)))
+                      vehicle_type = spot.get('vehicle_type', 'none')
+                      
+                      if status == 'OCCUPIED':
+                          occupied_count += 1
+                      else:
+                          vacant_count += 1
+
+                      batch.put_item(
+                          Item={
+                              'SpotId': spot_id,
+                              'ZoneId': zone_id,
+                              'Status': status,
+                              'Confidence': confidence,
+                              'VehicleType': vehicle_type,
+                              'LastUpdated': timestamp,
+                              'ImageS3Url': image_s3_url
+                          }
+                      )
+
+              occupancy_pct = (occupied_count / total_spots * 100) if total_spots > 0 else 0
+              print(f"Zone {zone_id}: {occupied_count}/{total_spots} occupied ({occupancy_pct:.1f}%)")
+
+              # Check alert conditions
+              if occupancy_pct >= THRESHOLD_PCT and SNS_TOPIC_ARN:
+                  alert_msg = (
+                      f"🚨 CAMPUS PARKING ALERT 🚨\n\n"
+                      f"Zone: {zone_id}\n"
+                      f"Occupancy: {occupancy_pct:.1f}% ({occupied_count}/{total_spots} spots filled)\n"
+                      f"Available spots: {vacant_count}\n"
+                      f"Time: {timestamp} UTC\n\n"
+                      f"Drivers are advised to seek parking in alternative zones."
+                  )
+                  sns_client.publish(
+                      TopicArn=SNS_TOPIC_ARN,
+                      Subject=f"Campus Parking Alert: Zone {zone_id} is {occupancy_pct:.0f}% Full",
+                      Message=alert_msg
+                  )
+                  print("SNS Alert Published successfully.")
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Parking availability updated successfully',
+                      'zone_id': zone_id,
+                      'total_spots': total_spots,
+                      'occupied': occupied_count,
+                      'vacant': vacant_count,
+                      'occupancy_percentage': occupancy_pct
+                  })
+              }
+
+  # -------------------------------------------------------------
+  # 6. Lambda Permission for S3 to Invoke Lambda
+  # -------------------------------------------------------------
+  LambdaS3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ParkingProcessorFunction.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt ParkingStorageBucket.Arn
+
+  # -------------------------------------------------------------
+  # 7. IAM Role & Profile for EC2 Computer Vision Instance
+  # -------------------------------------------------------------
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'CampusParkingEC2Role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EC2ParkingS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ParkingStorageBucket.Arn
+                  - !Sub '${ParkingStorageBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ParkingProcessorFunction.Arn
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: CampusParkingEC2InstanceProfile
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # -------------------------------------------------------------
+  # 8. EC2 Security Group
+  # -------------------------------------------------------------
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Campus Parking EC2 CV & Streamlit server
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH Access
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          CidrIp: 0.0.0.0/0
+          Description: Streamlit Live Web Dashboard
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP Access
+
+Outputs:
+  BucketName:
+    Description: S3 Storage Bucket for Camera Feeds
+    Value: !Ref ParkingStorageBucket
+  DynamoDBTableName:
+    Description: DynamoDB Table for Parking Spot Availability
+    Value: !Ref ParkingSpotsTable
+  SNSTopicArn:
+    Description: SNS Topic ARN for Parking Notifications
+    Value: !Ref ParkingAlertsTopic
+  LambdaFunctionName:
+    Description: Lambda Processor Function
+    Value: !Ref ParkingProcessorFunction
+  EC2InstanceProfileName:
+    Description: EC2 Instance Profile to attach to your EC2 instance
+    Value: !Ref EC2InstanceProfile
